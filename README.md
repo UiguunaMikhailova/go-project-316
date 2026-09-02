@@ -9,7 +9,7 @@
 
 ## Требования
 
-* Go 1.24+
+* Go 1.25+
 * make
 * golangci-lint (опционально, для `make lint`)
 
@@ -65,11 +65,24 @@ bin/hexlet-go-crawler --depth 2 --workers 8 --rps 5 https://example.com
       "depth": 0,
       "http_status": 200,
       "status": "ok",
-      "error": ""
+      "error": "",
+      "broken_links": [
+        {
+          "url": "https://example.com/assets/ghost.css",
+          "status_code": 404
+        },
+        {
+          "url": "https://cdn.example.com/app.js",
+          "error": "Get \"https://cdn.example.com/app.js\": dial tcp: lookup cdn.example.com: no such host"
+        }
+      ],
+      "discovered_at": "2024-05-18T12:34:56Z"
     }
   ]
 }
 ```
+
+В `broken_links` попадают только недоступные ссылки — ответ 4xx/5xx или сетевая ошибка.
 
 Сетевые ошибки не роняют утилиту: они попадают в поля `status` и `error`
 соответствующей страницы, а код выхода остаётся `0`.

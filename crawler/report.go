@@ -21,11 +21,20 @@ type Report struct {
 
 // Page — одна пройденная страница.
 type Page struct {
+	URL          string       `json:"url"`
+	Depth        int          `json:"depth"`
+	HTTPStatus   int          `json:"http_status"`
+	Status       string       `json:"status"`
+	Error        string       `json:"error"`
+	BrokenLinks  []BrokenLink `json:"broken_links"`
+	DiscoveredAt time.Time    `json:"discovered_at"`
+}
+
+// BrokenLink — ссылка, недоступная при проверке.
+type BrokenLink struct {
 	URL        string `json:"url"`
-	Depth      int    `json:"depth"`
-	HTTPStatus int    `json:"http_status"`
-	Status     string `json:"status"`
-	Error      string `json:"error"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // encode сериализует отчёт в JSON, при indent — в читаемом виде.

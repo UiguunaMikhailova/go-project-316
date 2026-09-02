@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -21,6 +22,14 @@ type crawler struct {
 
 	rateMu        sync.Mutex
 	nextRequestAt time.Time
+
+	linksMu sync.Mutex
+	links   map[string]linkStatus
+}
+
+type linkStatus struct {
+	code int
+	err  string
 }
 
 // Analyze обходит сайт, описанный в opts, и возвращает JSON-отчёт.
@@ -41,6 +50,7 @@ func newCrawler(opts Options) *crawler {
 		opts:    opts,
 		client:  opts.HTTPClient,
 		visited: make(map[string]struct{}),
+		links:   make(map[string]linkStatus),
 	}
 }
 
@@ -61,9 +71,15 @@ func (c *crawler) visit(ctx context.Context, rawURL string, depth int) {
 
 // fetchPage выполняет запрос и превращает его результат в запись отчёта.
 func (c *crawler) fetchPage(ctx context.Context, rawURL string, depth int) Page {
-	page := Page{URL: rawURL, Depth: depth, Status: StatusOK}
+	page := Page{
+		URL:          rawURL,
+		Depth:        depth,
+		Status:       StatusOK,
+		BrokenLinks:  make([]BrokenLink, 0),
+		DiscoveredAt: time.Now().UTC().Truncate(time.Second),
+	}
 
-	resp, err := c.request(ctx, rawURL)
+	resp, err := c.request(ctx, http.MethodGet, rawURL)
 	if err != nil {
 		page.Status = StatusError
 		page.Error = err.Error()
@@ -73,19 +89,103 @@ func (c *crawler) fetchPage(ctx context.Context, rawURL string, depth int) Page 
 
 	defer func() { _ = resp.Body.Close() }()
 
-	_, _ = io.Copy(io.Discard, resp.Body)
-
 	page.HTTPStatus = resp.StatusCode
 	if resp.StatusCode >= http.StatusBadRequest {
 		page.Status = StatusError
 		page.Error = fmt.Sprintf("unexpected status %d", resp.StatusCode)
+
+		return page
 	}
+
+	page.BrokenLinks = c.checkLinks(ctx, c.pageLinks(resp, rawURL))
 
 	return page
 }
 
-// request отправляет GET-запрос, повторяя его opts.Retries раз при неудаче.
-func (c *crawler) request(ctx context.Context, rawURL string) (*http.Response, error) {
+func (c *crawler) pageLinks(resp *http.Response, rawURL string) []string {
+	if !isHTML(resp.Header.Get("Content-Type")) {
+		return nil
+	}
+
+	base := resp.Request.URL
+	if base == nil {
+		parsed, err := url.Parse(rawURL)
+		if err != nil {
+			return nil
+		}
+
+		base = parsed
+	}
+
+	return extractLinks(base, resp.Body)
+}
+
+func (c *crawler) checkLinks(ctx context.Context, links []string) []BrokenLink {
+	broken := make([]BrokenLink, 0)
+
+	for _, link := range links {
+		status := c.linkStatus(ctx, link)
+
+		switch {
+		case status.err != "":
+			broken = append(broken, BrokenLink{URL: link, Error: status.err})
+		case status.code >= http.StatusBadRequest:
+			broken = append(broken, BrokenLink{URL: link, StatusCode: status.code})
+		}
+	}
+
+	return broken
+}
+
+// linkStatus проверяет каждую ссылку не больше одного раза за обход.
+func (c *crawler) linkStatus(ctx context.Context, rawURL string) linkStatus {
+	c.linksMu.Lock()
+	cached, ok := c.links[rawURL]
+	c.linksMu.Unlock()
+
+	if ok {
+		return cached
+	}
+
+	status := c.probeLink(ctx, rawURL)
+
+	c.linksMu.Lock()
+	c.links[rawURL] = status
+	c.linksMu.Unlock()
+
+	return status
+}
+
+// probeLink спрашивает ресурс через HEAD и повторяет через GET, если метод не поддержан.
+func (c *crawler) probeLink(ctx context.Context, rawURL string) linkStatus {
+	code, err := c.statusCode(ctx, http.MethodHead, rawURL)
+	if err == nil && code != http.StatusMethodNotAllowed && code != http.StatusNotImplemented {
+		return linkStatus{code: code}
+	}
+
+	code, err = c.statusCode(ctx, http.MethodGet, rawURL)
+	if err != nil {
+		return linkStatus{err: err.Error()}
+	}
+
+	return linkStatus{code: code}
+}
+
+func (c *crawler) statusCode(ctx context.Context, method, rawURL string) (int, error) {
+	resp, err := c.request(ctx, method, rawURL)
+	if err != nil {
+		return 0, err
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return resp.StatusCode, nil
+}
+
+// request отправляет запрос, повторяя его opts.Retries раз при неудаче.
+func (c *crawler) request(ctx context.Context, method, rawURL string) (*http.Response, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= c.opts.Retries; attempt++ {
@@ -93,7 +193,7 @@ func (c *crawler) request(ctx context.Context, rawURL string) (*http.Response, e
 			return nil, err
 		}
 
-		resp, err := c.do(ctx, rawURL)
+		resp, err := c.do(ctx, method, rawURL)
 		if err == nil {
 			return resp, nil
 		}
@@ -109,10 +209,10 @@ func (c *crawler) request(ctx context.Context, rawURL string) (*http.Response, e
 }
 
 // do выполняет одну попытку, ограниченную таймаутом запроса.
-func (c *crawler) do(ctx context.Context, rawURL string) (*http.Response, error) {
+func (c *crawler) do(ctx context.Context, method, rawURL string) (*http.Response, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, c.opts.Timeout)
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, method, rawURL, nil)
 	if err != nil {
 		cancel()
 

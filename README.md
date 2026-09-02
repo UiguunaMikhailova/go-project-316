@@ -1,5 +1,6 @@
 ### Hexlet tests and linter status:
 [![Actions Status](https://github.com/UiguunaMikhailova/go-project-316/actions/workflows/hexlet-check.yml/badge.svg)](https://github.com/UiguunaMikhailova/go-project-316/actions)
+[![ci](https://github.com/UiguunaMikhailova/go-project-316/actions/workflows/ci.yml/badge.svg)](https://github.com/UiguunaMikhailova/go-project-316/actions/workflows/ci.yml)
 
 # hexlet-go-crawler
 

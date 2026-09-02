@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -117,15 +118,58 @@ func TestAnalyzeReportsNetworkError(t *testing.T) {
 }
 
 func TestAnalyzeReportsBadHTTPStatus(t *testing.T) {
-	client := stubClient(func(req *http.Request) (*http.Response, error) {
-		return response(http.StatusNotFound, "", req), nil
+	statuses := []int{http.StatusNotFound, http.StatusInternalServerError, http.StatusServiceUnavailable}
+
+	for _, status := range statuses {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			client := stubClient(func(req *http.Request) (*http.Response, error) {
+				return response(status, "", req), nil
+			})
+
+			report := analyze(t, crawler.Options{URL: "https://example.com", HTTPClient: client})
+
+			page := report.Pages[0]
+			if page.HTTPStatus != status || page.Status != crawler.StatusError || page.Error == "" {
+				t.Errorf("page = %+v, want error status with code %d", page, status)
+			}
+		})
+	}
+}
+
+func TestAnalyzeReportsTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	report := analyze(t, crawler.Options{
+		URL:        server.URL,
+		Timeout:    50 * time.Millisecond,
+		HTTPClient: server.Client(),
 	})
 
-	report := analyze(t, crawler.Options{URL: "https://example.com", HTTPClient: client})
+	page := report.Pages[0]
+	if page.Status != crawler.StatusError || page.HTTPStatus != 0 {
+		t.Errorf("page = %+v, want error status without http code", page)
+	}
+
+	if !strings.Contains(page.Error, "deadline exceeded") {
+		t.Errorf("page.Error = %q, want a deadline error", page.Error)
+	}
+}
+
+func TestAnalyzeCollectsPageFromTestServer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html><body>hello</body></html>"))
+	}))
+	defer server.Close()
+
+	report := analyze(t, crawler.Options{URL: server.URL, HTTPClient: server.Client()})
 
 	page := report.Pages[0]
-	if page.HTTPStatus != http.StatusNotFound || page.Status != crawler.StatusError {
-		t.Errorf("page = %+v, want error status with code 404", page)
+	if page.URL != server.URL || page.HTTPStatus != http.StatusOK || page.Status != crawler.StatusOK {
+		t.Errorf("page = %+v, want ok status for %s", page, server.URL)
 	}
 }
 

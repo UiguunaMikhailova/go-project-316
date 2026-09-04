@@ -26,9 +26,15 @@ func parseDocument(body io.Reader) *html.Node {
 	return doc
 }
 
-func extractLinks(base *url.URL, doc *html.Node) []string {
-	links := make([]string, 0)
-	seen := make(map[string]struct{})
+// pageLink — найденная на странице ссылка; followed отмечает переход по <a>.
+type pageLink struct {
+	url      string
+	followed bool
+}
+
+func extractLinks(base *url.URL, doc *html.Node) []pageLink {
+	links := make([]pageLink, 0)
+	positions := make(map[string]int)
 
 	for node := range doc.Descendants() {
 		link, ok := nodeLink(base, node)
@@ -36,34 +42,43 @@ func extractLinks(base *url.URL, doc *html.Node) []string {
 			continue
 		}
 
-		if _, duplicate := seen[link]; duplicate {
+		if position, duplicate := positions[link.url]; duplicate {
+			links[position].followed = links[position].followed || link.followed
+
 			continue
 		}
 
-		seen[link] = struct{}{}
+		positions[link.url] = len(links)
 		links = append(links, link)
 	}
 
 	return links
 }
 
-func nodeLink(base *url.URL, node *html.Node) (string, bool) {
+func nodeLink(base *url.URL, node *html.Node) (pageLink, bool) {
 	if node.Type != html.ElementNode {
-		return "", false
+		return pageLink{}, false
 	}
 
 	name, ok := linkAttributes[node.Data]
 	if !ok {
-		return "", false
+		return pageLink{}, false
 	}
 
 	for _, attr := range node.Attr {
-		if attr.Key == name {
-			return resolveLink(base, attr.Val)
+		if attr.Key != name {
+			continue
 		}
+
+		resolved, ok := resolveLink(base, attr.Val)
+		if !ok {
+			return pageLink{}, false
+		}
+
+		return pageLink{url: resolved, followed: node.Data == "a"}, true
 	}
 
-	return "", false
+	return pageLink{}, false
 }
 
 func resolveLink(base *url.URL, raw string) (string, bool) {

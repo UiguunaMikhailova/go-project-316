@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,6 +16,7 @@ import (
 type crawler struct {
 	opts   Options
 	client *http.Client
+	root   *url.URL
 
 	mu      sync.Mutex
 	visited map[string]struct{}
@@ -32,6 +34,12 @@ type linkStatus struct {
 	err  string
 }
 
+// task — адрес в очереди обхода и его расстояние от стартовой страницы.
+type task struct {
+	url   string
+	depth int
+}
+
 // Analyze обходит сайт, описанный в opts, и возвращает JSON-отчёт.
 func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	opts, err := opts.normalized()
@@ -46,31 +54,86 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 }
 
 func newCrawler(opts Options) *crawler {
+	root, err := url.Parse(opts.URL)
+	if err != nil {
+		root = &url.URL{}
+	}
+
 	return &crawler{
 		opts:    opts,
 		client:  opts.HTTPClient,
+		root:    root,
 		visited: make(map[string]struct{}),
 		links:   make(map[string]linkStatus),
 	}
 }
 
+// run обходит сайт в ширину, пока очередь не опустеет или не отменят контекст.
 func (c *crawler) run(ctx context.Context) Report {
-	c.visit(ctx, c.opts.URL, 0)
+	queue := c.visit(ctx, task{url: c.opts.URL})
+
+	for len(queue) > 0 && ctx.Err() == nil {
+		current := queue[0]
+		queue = append(queue[1:], c.visit(ctx, current)...)
+	}
 
 	return c.report()
 }
 
-// visit загружает адрес, если он ещё не встречался.
-func (c *crawler) visit(ctx context.Context, rawURL string, depth int) {
-	if !c.markVisited(rawURL) {
-		return
+// visit загружает адрес и возвращает задачи следующего уровня.
+func (c *crawler) visit(ctx context.Context, current task) []task {
+	if !c.markVisited(current.url) {
+		return nil
 	}
 
-	c.addPage(c.fetchPage(ctx, rawURL, depth))
+	page, links := c.fetchPage(ctx, current.url, current.depth)
+	c.addPage(page)
+
+	return c.nextTasks(links, current.depth)
+}
+
+// nextTasks оставляет только внутренние ссылки, до которых достаёт глубина обхода.
+func (c *crawler) nextTasks(links []pageLink, depth int) []task {
+	next := depth + 1
+	if next >= c.opts.Depth {
+		return nil
+	}
+
+	tasks := make([]task, 0)
+
+	for _, link := range links {
+		if !link.followed || !c.internal(link.url) || c.broken(link.url) {
+			continue
+		}
+
+		tasks = append(tasks, task{url: link.url, depth: next})
+	}
+
+	return tasks
+}
+
+// broken сообщает, что ссылка уже проверена и оказалась недоступной.
+func (c *crawler) broken(rawURL string) bool {
+	c.linksMu.Lock()
+	defer c.linksMu.Unlock()
+
+	status, ok := c.links[rawURL]
+
+	return ok && (status.err != "" || status.code >= http.StatusBadRequest)
+}
+
+// internal сообщает, ведёт ли ссылка на домен стартовой страницы.
+func (c *crawler) internal(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(parsed.Host, c.root.Host)
 }
 
 // fetchPage выполняет запрос и превращает его результат в запись отчёта.
-func (c *crawler) fetchPage(ctx context.Context, rawURL string, depth int) Page {
+func (c *crawler) fetchPage(ctx context.Context, rawURL string, depth int) (Page, []pageLink) {
 	page := Page{
 		URL:          rawURL,
 		Depth:        depth,
@@ -83,38 +146,45 @@ func (c *crawler) fetchPage(ctx context.Context, rawURL string, depth int) Page 
 	if err != nil {
 		page.Status = StatusError
 		page.Error = err.Error()
+		c.rememberLink(rawURL, linkStatus{err: err.Error()})
 
-		return page
+		return page, nil
 	}
 
 	defer func() { _ = resp.Body.Close() }()
 
 	page.HTTPStatus = resp.StatusCode
+	c.rememberLink(rawURL, linkStatus{code: resp.StatusCode})
+
 	if resp.StatusCode >= http.StatusBadRequest {
 		page.Status = StatusError
 		page.Error = fmt.Sprintf("unexpected status %d", resp.StatusCode)
 
-		return page
+		return page, nil
 	}
 
-	c.analyzeBody(ctx, &page, resp)
+	links := c.analyzeBody(ctx, &page, resp)
 
-	return page
+	return page, links
 }
 
 // analyzeBody разбирает HTML один раз: и для SEO-тегов, и для ссылок.
-func (c *crawler) analyzeBody(ctx context.Context, page *Page, resp *http.Response) {
+func (c *crawler) analyzeBody(ctx context.Context, page *Page, resp *http.Response) []pageLink {
 	if !isHTML(resp.Header.Get("Content-Type")) {
-		return
+		return nil
 	}
 
 	doc := parseDocument(resp.Body)
 	if doc == nil {
-		return
+		return nil
 	}
 
+	links := extractLinks(c.baseURL(resp, page.URL), doc)
+
 	page.SEO = extractSEO(doc)
-	page.BrokenLinks = c.checkLinks(ctx, extractLinks(c.baseURL(resp, page.URL), doc))
+	page.BrokenLinks = c.checkLinks(ctx, links)
+
+	return links
 }
 
 func (c *crawler) baseURL(resp *http.Response, rawURL string) *url.URL {
@@ -130,17 +200,17 @@ func (c *crawler) baseURL(resp *http.Response, rawURL string) *url.URL {
 	return base
 }
 
-func (c *crawler) checkLinks(ctx context.Context, links []string) []BrokenLink {
+func (c *crawler) checkLinks(ctx context.Context, links []pageLink) []BrokenLink {
 	broken := make([]BrokenLink, 0)
 
 	for _, link := range links {
-		status := c.linkStatus(ctx, link)
+		status := c.linkStatus(ctx, link.url)
 
 		switch {
 		case status.err != "":
-			broken = append(broken, BrokenLink{URL: link, Error: status.err})
+			broken = append(broken, BrokenLink{URL: link.url, Error: status.err})
 		case status.code >= http.StatusBadRequest:
-			broken = append(broken, BrokenLink{URL: link, StatusCode: status.code})
+			broken = append(broken, BrokenLink{URL: link.url, StatusCode: status.code})
 		}
 	}
 
@@ -158,12 +228,16 @@ func (c *crawler) linkStatus(ctx context.Context, rawURL string) linkStatus {
 	}
 
 	status := c.probeLink(ctx, rawURL)
-
-	c.linksMu.Lock()
-	c.links[rawURL] = status
-	c.linksMu.Unlock()
+	c.rememberLink(rawURL, status)
 
 	return status
+}
+
+func (c *crawler) rememberLink(rawURL string, status linkStatus) {
+	c.linksMu.Lock()
+	defer c.linksMu.Unlock()
+
+	c.links[rawURL] = status
 }
 
 // probeLink спрашивает ресурс через HEAD и повторяет через GET, если метод не поддержан.

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -386,7 +388,7 @@ func TestAnalyzeChecksEveryLinkOnce(t *testing.T) {
 		return response(http.StatusNotFound, "", req), nil
 	})
 
-	report := analyze(t, crawler.Options{URL: "https://example.com", HTTPClient: client})
+	report := analyze(t, crawler.Options{URL: "https://example.com", Depth: 1, HTTPClient: client})
 
 	if got := atomic.LoadInt32(&checks); got != 1 {
 		t.Errorf("link checks = %d, want 1", got)
@@ -505,5 +507,189 @@ func TestAnalyzeIgnoresSVGTitle(t *testing.T) {
 
 	if page.SEO.HasTitle || page.SEO.Title != "" {
 		t.Errorf("seo = %+v, want no title outside the head", page.SEO)
+	}
+}
+
+// siteClient отвечает подготовленным HTML на адреса внутри https://example.com.
+func siteClient(t *testing.T, pages map[string]string) *http.Client {
+	t.Helper()
+
+	return stubClient(func(req *http.Request) (*http.Response, error) {
+		body, ok := pages[req.URL.String()]
+		if !ok {
+			return response(http.StatusNotFound, "", req), nil
+		}
+
+		return htmlResponse(body, req), nil
+	})
+}
+
+func pageURLs(report crawler.Report) []string {
+	urls := make([]string, 0, len(report.Pages))
+	for _, page := range report.Pages {
+		urls = append(urls, page.URL)
+	}
+
+	return urls
+}
+
+func TestAnalyzeRespectsDepthLimit(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com":                 `<html><body><a href="/child.html">child</a></body></html>`,
+		"https://example.com/child.html":      `<html><body><a href="/grandchild.html">grandchild</a></body></html>`,
+		"https://example.com/grandchild.html": `<html><body>the end</body></html>`,
+	}
+
+	cases := []struct {
+		depth int
+		want  []string
+	}{
+		{depth: 1, want: []string{"https://example.com"}},
+		{depth: 2, want: []string{"https://example.com", "https://example.com/child.html"}},
+		{depth: 3, want: []string{
+			"https://example.com",
+			"https://example.com/child.html",
+			"https://example.com/grandchild.html",
+		}},
+	}
+
+	for _, testCase := range cases {
+		t.Run(fmt.Sprintf("depth %d", testCase.depth), func(t *testing.T) {
+			report := analyze(t, crawler.Options{
+				URL:        "https://example.com",
+				Depth:      testCase.depth,
+				HTTPClient: siteClient(t, pages),
+			})
+
+			if got := pageURLs(report); !slices.Equal(got, testCase.want) {
+				t.Errorf("pages = %v, want %v", got, testCase.want)
+			}
+
+			if report.Depth != testCase.depth {
+				t.Errorf("report depth = %d, want %d", report.Depth, testCase.depth)
+			}
+		})
+	}
+}
+
+func TestAnalyzeReportsPageDepth(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com":            `<html><body><a href="/child.html">child</a></body></html>`,
+		"https://example.com/child.html": `<html><body>child</body></html>`,
+	}
+
+	report := analyze(t, crawler.Options{URL: "https://example.com", Depth: 2, HTTPClient: siteClient(t, pages)})
+
+	if report.Pages[0].Depth != 0 || report.Pages[1].Depth != 1 {
+		t.Errorf("depths = %d, %d, want 0, 1", report.Pages[0].Depth, report.Pages[1].Depth)
+	}
+}
+
+func TestAnalyzeSkipsExternalPages(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com": `<html><body>
+			<a href="/first.html">first</a>
+			<a href="/second.html">second</a>
+			<a href="https://other.test/page.html">external</a>
+		</body></html>`,
+		"https://example.com/first.html":  `<html><body>first</body></html>`,
+		"https://example.com/second.html": `<html><body>second</body></html>`,
+	}
+
+	client := stubClient(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "other.test" {
+			if req.Method != http.MethodHead && req.Method != http.MethodGet {
+				t.Errorf("unexpected method %s for an external link", req.Method)
+			}
+
+			return response(http.StatusNotFound, "", req), nil
+		}
+
+		body, ok := pages[req.URL.String()]
+		if !ok {
+			return response(http.StatusNotFound, "", req), nil
+		}
+
+		return htmlResponse(body, req), nil
+	})
+
+	report := analyze(t, crawler.Options{URL: "https://example.com", Depth: 3, HTTPClient: client})
+
+	want := []string{
+		"https://example.com",
+		"https://example.com/first.html",
+		"https://example.com/second.html",
+	}
+
+	if got := pageURLs(report); !slices.Equal(got, want) {
+		t.Errorf("pages = %v, want only internal pages %v", got, want)
+	}
+
+	broken := report.Pages[0].BrokenLinks
+	if len(broken) != 1 || broken[0].URL != "https://other.test/page.html" {
+		t.Errorf("broken links = %+v, want the external link checked", broken)
+	}
+}
+
+func TestAnalyzeVisitsEveryPageOnce(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com": `<html><body>
+			<a href="/child.html">first</a>
+			<a href="/child.html">duplicate</a>
+			<a href="/child.html#anchor">with anchor</a>
+		</body></html>`,
+		"https://example.com/child.html": `<html><body><a href="https://example.com">back home</a></body></html>`,
+	}
+
+	report := analyze(t, crawler.Options{URL: "https://example.com", Depth: 5, HTTPClient: siteClient(t, pages)})
+
+	want := []string{"https://example.com", "https://example.com/child.html"}
+	if got := pageURLs(report); !slices.Equal(got, want) {
+		t.Errorf("pages = %v, want %v", got, want)
+	}
+}
+
+func TestAnalyzeKeepsReportValidWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pages := map[string]string{
+		"https://example.com": `<html><body>
+			<a href="/first.html">first</a>
+			<a href="/second.html">second</a>
+		</body></html>`,
+		"https://example.com/first.html":  `<html><body>first</body></html>`,
+		"https://example.com/second.html": `<html><body>second</body></html>`,
+	}
+
+	client := stubClient(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() == "https://example.com/first.html" {
+			cancel()
+		}
+
+		body, ok := pages[req.URL.String()]
+		if !ok {
+			return response(http.StatusNotFound, "", req), nil
+		}
+
+		return htmlResponse(body, req), nil
+	})
+
+	data, err := crawler.Analyze(ctx, crawler.Options{URL: "https://example.com", Depth: 3, HTTPClient: client})
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+
+	var report crawler.Report
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("report is not valid json: %v", err)
+	}
+
+	if report.RootURL != "https://example.com" || len(report.Pages) == 0 {
+		t.Errorf("report = %+v, want the pages collected before the cancellation", report)
+	}
+
+	if len(report.Pages) > 2 {
+		t.Errorf("pages = %v, want the crawl to stop after the cancellation", pageURLs(report))
 	}
 }

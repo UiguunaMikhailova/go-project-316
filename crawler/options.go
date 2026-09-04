@@ -52,8 +52,8 @@ func (o Options) normalized() (Options, error) {
 		return o, fmt.Errorf("unsupported url %q: host is missing", o.URL)
 	}
 
-	if o.Depth < 0 {
-		o.Depth = 0
+	if o.Depth <= 0 {
+		o.Depth = DefaultDepth
 	}
 
 	if o.Retries < 0 {

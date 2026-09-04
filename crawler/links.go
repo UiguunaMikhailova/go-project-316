@@ -17,12 +17,16 @@ var linkAttributes = map[string]string{
 	"source": "src",
 }
 
-func extractLinks(base *url.URL, body io.Reader) []string {
+func parseDocument(body io.Reader) *html.Node {
 	doc, err := html.Parse(body)
 	if err != nil {
 		return nil
 	}
 
+	return doc
+}
+
+func extractLinks(base *url.URL, doc *html.Node) []string {
 	links := make([]string, 0)
 	seen := make(map[string]struct{})
 

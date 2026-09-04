@@ -26,8 +26,18 @@ type Page struct {
 	HTTPStatus   int          `json:"http_status"`
 	Status       string       `json:"status"`
 	Error        string       `json:"error"`
+	SEO          SEO          `json:"seo"`
 	BrokenLinks  []BrokenLink `json:"broken_links"`
 	DiscoveredAt time.Time    `json:"discovered_at"`
+}
+
+// SEO — базовые SEO-теги страницы.
+type SEO struct {
+	HasTitle       bool   `json:"has_title"`
+	Title          string `json:"title"`
+	HasDescription bool   `json:"has_description"`
+	Description    string `json:"description"`
+	HasH1          bool   `json:"has_h1"`
 }
 
 // BrokenLink — ссылка, недоступная при проверке.

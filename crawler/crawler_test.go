@@ -421,3 +421,89 @@ func TestAnalyzeChecksAssetLinks(t *testing.T) {
 		t.Errorf("broken links = %+v, want only the missing stylesheet", broken)
 	}
 }
+
+func analyzeHTML(t *testing.T, body string) crawler.Page {
+	t.Helper()
+
+	client := stubClient(func(req *http.Request) (*http.Response, error) {
+		return htmlResponse(body, req), nil
+	})
+
+	report := analyze(t, crawler.Options{URL: "https://example.com", HTTPClient: client})
+
+	return report.Pages[0]
+}
+
+func TestAnalyzeCollectsSEOTags(t *testing.T) {
+	page := analyzeHTML(t, `<html>
+		<head>
+			<title>Example Test</title>
+			<meta name="description" content="Short page description">
+		</head>
+		<body><h1>Hello</h1></body>
+	</html>`)
+
+	want := crawler.SEO{
+		HasTitle:       true,
+		Title:          "Example Test",
+		HasDescription: true,
+		Description:    "Short page description",
+		HasH1:          true,
+	}
+
+	if page.SEO != want {
+		t.Errorf("seo = %+v, want %+v", page.SEO, want)
+	}
+}
+
+func TestAnalyzeReportsMissingSEOTags(t *testing.T) {
+	page := analyzeHTML(t, `<html><head></head><body><p>no tags here</p></body></html>`)
+
+	want := crawler.SEO{}
+	if page.SEO != want {
+		t.Errorf("seo = %+v, want empty flags and strings", page.SEO)
+	}
+}
+
+func TestAnalyzeDecodesHTMLEntities(t *testing.T) {
+	page := analyzeHTML(t, `<html>
+		<head>
+			<title>Tom &amp; Jerry &mdash; &#39;home&#39;</title>
+			<meta name="description" content="Caf&eacute; &lt;test&gt;">
+		</head>
+		<body><h1>x</h1></body>
+	</html>`)
+
+	if page.SEO.Title != "Tom & Jerry — 'home'" {
+		t.Errorf("title = %q, want decoded entities", page.SEO.Title)
+	}
+
+	if page.SEO.Description != "Café <test>" {
+		t.Errorf("description = %q, want decoded entities", page.SEO.Description)
+	}
+}
+
+func TestAnalyzeCleansSEOWhitespace(t *testing.T) {
+	page := analyzeHTML(t, "<html><head><title>\n\t Example   Test \n</title></head><body></body></html>")
+
+	if page.SEO.Title != "Example Test" {
+		t.Errorf("title = %q, want %q", page.SEO.Title, "Example Test")
+	}
+}
+
+func TestAnalyzeKeepsFlagsForEmptySEOTags(t *testing.T) {
+	page := analyzeHTML(t, `<html><head><title></title><meta name="description" content=""></head><body><h1></h1></body></html>`)
+
+	want := crawler.SEO{HasTitle: true, HasDescription: true, HasH1: true}
+	if page.SEO != want {
+		t.Errorf("seo = %+v, want %+v", page.SEO, want)
+	}
+}
+
+func TestAnalyzeIgnoresSVGTitle(t *testing.T) {
+	page := analyzeHTML(t, `<html><head></head><body><svg><title>icon</title></svg></body></html>`)
+
+	if page.SEO.HasTitle || page.SEO.Title != "" {
+		t.Errorf("seo = %+v, want no title outside the head", page.SEO)
+	}
+}

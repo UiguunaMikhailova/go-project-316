@@ -97,27 +97,37 @@ func (c *crawler) fetchPage(ctx context.Context, rawURL string, depth int) Page 
 		return page
 	}
 
-	page.BrokenLinks = c.checkLinks(ctx, c.pageLinks(resp, rawURL))
+	c.analyzeBody(ctx, &page, resp)
 
 	return page
 }
 
-func (c *crawler) pageLinks(resp *http.Response, rawURL string) []string {
+// analyzeBody разбирает HTML один раз: и для SEO-тегов, и для ссылок.
+func (c *crawler) analyzeBody(ctx context.Context, page *Page, resp *http.Response) {
 	if !isHTML(resp.Header.Get("Content-Type")) {
-		return nil
+		return
 	}
 
-	base := resp.Request.URL
-	if base == nil {
-		parsed, err := url.Parse(rawURL)
-		if err != nil {
-			return nil
-		}
-
-		base = parsed
+	doc := parseDocument(resp.Body)
+	if doc == nil {
+		return
 	}
 
-	return extractLinks(base, resp.Body)
+	page.SEO = extractSEO(doc)
+	page.BrokenLinks = c.checkLinks(ctx, extractLinks(c.baseURL(resp, page.URL), doc))
+}
+
+func (c *crawler) baseURL(resp *http.Response, rawURL string) *url.URL {
+	if resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL
+	}
+
+	base, err := url.Parse(rawURL)
+	if err != nil {
+		return &url.URL{}
+	}
+
+	return base
 }
 
 func (c *crawler) checkLinks(ctx context.Context, links []string) []BrokenLink {

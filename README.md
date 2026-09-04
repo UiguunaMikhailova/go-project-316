@@ -66,6 +66,13 @@ bin/hexlet-go-crawler --depth 2 --workers 8 --rps 5 https://example.com
       "http_status": 200,
       "status": "ok",
       "error": "",
+      "seo": {
+        "has_title": true,
+        "title": "Example Domain",
+        "has_description": false,
+        "description": "",
+        "has_h1": true
+      },
       "broken_links": [
         {
           "url": "https://example.com/assets/ghost.css",

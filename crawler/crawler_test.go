@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -691,5 +692,197 @@ func TestAnalyzeKeepsReportValidWhenContextIsCanceled(t *testing.T) {
 
 	if len(report.Pages) > 2 {
 		t.Errorf("pages = %v, want the crawl to stop after the cancellation", pageURLs(report))
+	}
+}
+
+// linkedPage возвращает HTML со ссылками на count внутренних адресов.
+func linkedPage(count int) string {
+	var body strings.Builder
+
+	body.WriteString("<html><body>")
+
+	for i := range count {
+		fmt.Fprintf(&body, `<a href="/page-%d.html">page %d</a>`, i, i)
+	}
+
+	body.WriteString("</body></html>")
+
+	return body.String()
+}
+
+// recordingClient отвечает на любой адрес и запоминает время каждого запроса.
+func recordingClient(times *[]time.Time, mu *sync.Mutex, body string) *http.Client {
+	return stubClient(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+
+		*times = append(*times, time.Now())
+
+		mu.Unlock()
+
+		if req.URL.String() == "https://example.com" {
+			return htmlResponse(body, req), nil
+		}
+
+		return htmlResponse("<html><body>leaf</body></html>", req), nil
+	})
+}
+
+func TestAnalyzeLimitsRequestRate(t *testing.T) {
+	const (
+		delay  = 50 * time.Millisecond
+		window = 220 * time.Millisecond
+	)
+
+	var (
+		mu    sync.Mutex
+		times []time.Time
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), window)
+	defer cancel()
+
+	client := recordingClient(&times, &mu, linkedPage(20))
+
+	if _, err := crawler.Analyze(ctx, crawler.Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		Delay:      delay,
+		HTTPClient: client,
+	}); err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	want := int(window/delay) + 1
+	if len(times) > want {
+		t.Errorf("requests = %d, want at most %d in %v with a %v delay", len(times), want, window, delay)
+	}
+
+	if len(times) < 2 {
+		t.Errorf("requests = %d, want the crawl to make progress", len(times))
+	}
+}
+
+func TestAnalyzeSpacesRequestsEvenly(t *testing.T) {
+	const (
+		delay     = 40 * time.Millisecond
+		tolerance = 5 * time.Millisecond
+	)
+
+	var (
+		mu    sync.Mutex
+		times []time.Time
+	)
+
+	analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		Delay:      delay,
+		HTTPClient: recordingClient(&times, &mu, linkedPage(4)),
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(times) < 5 {
+		t.Fatalf("requests = %d, want the page and its four links", len(times))
+	}
+
+	for i := 1; i < len(times); i++ {
+		if gap := times[i].Sub(times[i-1]); gap < delay-tolerance {
+			t.Errorf("gap between requests %d and %d = %v, want at least %v", i-1, i, gap, delay)
+		}
+	}
+}
+
+func TestAnalyzeDoesNotSlowDownWithoutLimit(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		times []time.Time
+	)
+
+	start := time.Now()
+
+	analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		HTTPClient: recordingClient(&times, &mu, linkedPage(20)),
+	})
+
+	elapsed := time.Since(start)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(times) != 21 {
+		t.Fatalf("requests = %d, want 21", len(times))
+	}
+
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("elapsed = %v, want no artificial slowdown without a limit", elapsed)
+	}
+}
+
+func TestAnalyzeReportsSamePagesAtAnySpeed(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com": `<html><body>
+			<a href="/first.html">first</a>
+			<a href="/second.html">second</a>
+		</body></html>`,
+		"https://example.com/first.html":  `<html><body><a href="/third.html">third</a></body></html>`,
+		"https://example.com/second.html": `<html><body>second</body></html>`,
+		"https://example.com/third.html":  `<html><body>third</body></html>`,
+	}
+
+	fast := analyze(t, crawler.Options{URL: "https://example.com", Depth: 3, HTTPClient: siteClient(t, pages)})
+	slow := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Depth:      3,
+		Delay:      10 * time.Millisecond,
+		HTTPClient: siteClient(t, pages),
+	})
+
+	if !slices.Equal(pageURLs(fast), pageURLs(slow)) {
+		t.Errorf("pages = %v with a delay, want the same %v as without", pageURLs(slow), pageURLs(fast))
+	}
+
+	for _, page := range slow.Pages {
+		if page.Status != crawler.StatusOK {
+			t.Errorf("page = %+v, want ok status: a delay must not cause timeouts", page)
+		}
+	}
+}
+
+func TestAnalyzeStopsWaitingWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := stubClient(func(req *http.Request) (*http.Response, error) {
+		cancel()
+
+		return htmlResponse(linkedPage(5), req), nil
+	})
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		if _, err := crawler.Analyze(ctx, crawler.Options{
+			URL:        "https://example.com",
+			Depth:      2,
+			Delay:      time.Hour,
+			HTTPClient: client,
+		}); err != nil {
+			t.Errorf("Analyze() error = %v", err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Analyze() is still waiting for the delay after the context was canceled")
 	}
 }

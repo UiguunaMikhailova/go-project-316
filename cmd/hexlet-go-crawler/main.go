@@ -101,9 +101,18 @@ func optionsFrom(ctx *cli.Context) crawler.Options {
 }
 
 func delayFrom(ctx *cli.Context) time.Duration {
-	if rps := ctx.Float64("rps"); rps > 0 {
+	return rateDelay(ctx.Float64("rps"), ctx.Duration("delay"))
+}
+
+// rateDelay превращает --rps в паузу между запросами; --rps важнее --delay.
+func rateDelay(rps float64, delay time.Duration) time.Duration {
+	if rps > 0 {
 		return time.Duration(float64(time.Second) / rps)
 	}
 
-	return ctx.Duration("delay")
+	if delay < 0 {
+		return 0
+	}
+
+	return delay
 }

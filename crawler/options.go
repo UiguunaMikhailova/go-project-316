@@ -17,6 +17,12 @@ const (
 	DefaultUserAgent   = "hexlet-go-crawler/0.1"
 )
 
+// Паузы между повторными попытками: первая, а затем удвоение до предела.
+const (
+	baseRetryBackoff = 100 * time.Millisecond
+	maxRetryBackoff  = 2 * time.Second
+)
+
 // ErrEmptyURL возвращается, когда URL не задан.
 var ErrEmptyURL = errors.New("url is required")
 

@@ -268,28 +268,58 @@ func (c *crawler) statusCode(ctx context.Context, method, rawURL string) (int, e
 	return resp.StatusCode, nil
 }
 
-// request отправляет запрос, повторяя его opts.Retries раз при неудаче.
+// request отправляет запрос и повторяет его при временной ошибке,
+// но не больше opts.Retries раз; возвращается результат последней попытки.
 func (c *crawler) request(ctx context.Context, method, rawURL string) (*http.Response, error) {
-	var lastErr error
-
-	for attempt := 0; attempt <= c.opts.Retries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		if err := c.throttle(ctx); err != nil {
 			return nil, err
 		}
 
 		resp, err := c.do(ctx, method, rawURL)
-		if err == nil {
-			return resp, nil
+		if attempt >= c.opts.Retries || ctx.Err() != nil || !retryable(resp, err) {
+			return resp, err
 		}
 
-		lastErr = err
+		discard(resp)
 
-		if ctx.Err() != nil {
-			break
+		if err := wait(ctx, retryBackoff(attempt)); err != nil {
+			return nil, err
 		}
 	}
+}
 
-	return nil, lastErr
+// retryable отличает временную неудачу от окончательного ответа сервера.
+func retryable(resp *http.Response, err error) bool {
+	if err != nil {
+		return true
+	}
+
+	switch resp.StatusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	default:
+		return resp.StatusCode >= http.StatusInternalServerError
+	}
+}
+
+// retryBackoff удваивает паузу с каждой попыткой, чтобы не бомбить сервер.
+func retryBackoff(attempt int) time.Duration {
+	backoff := baseRetryBackoff << attempt
+	if backoff > maxRetryBackoff {
+		return maxRetryBackoff
+	}
+
+	return backoff
+}
+
+func discard(resp *http.Response) {
+	if resp == nil {
+		return
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 }
 
 // do выполняет одну попытку, ограниченную таймаутом запроса.
@@ -326,20 +356,30 @@ func (c *crawler) throttle(ctx context.Context) error {
 	c.rateMu.Lock()
 	defer c.rateMu.Unlock()
 
-	if wait := time.Until(c.nextRequestAt); wait > 0 {
-		timer := time.NewTimer(wait)
-		defer timer.Stop()
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-		}
+	if err := wait(ctx, time.Until(c.nextRequestAt)); err != nil {
+		return err
 	}
 
 	c.nextRequestAt = time.Now().Add(c.opts.Delay)
 
 	return ctx.Err()
+}
+
+// wait засыпает на заданное время и просыпается сразу после отмены контекста.
+func wait(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
+		return ctx.Err()
+	}
+
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // markVisited сообщает, встретился ли адрес впервые.

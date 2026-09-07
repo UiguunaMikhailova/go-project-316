@@ -886,3 +886,208 @@ func TestAnalyzeStopsWaitingWhenContextIsCanceled(t *testing.T) {
 		t.Fatal("Analyze() is still waiting for the delay after the context was canceled")
 	}
 }
+
+// sequenceClient отвечает заранее заданной последовательностью и считает запросы.
+func sequenceClient(calls *int32, answers ...roundTripFunc) *http.Client {
+	return stubClient(func(req *http.Request) (*http.Response, error) {
+		index := int(atomic.AddInt32(calls, 1)) - 1
+		if index >= len(answers) {
+			index = len(answers) - 1
+		}
+
+		return answers[index](req)
+	})
+}
+
+func status(code int) roundTripFunc {
+	return func(req *http.Request) (*http.Response, error) {
+		return response(code, "", req), nil
+	}
+}
+
+func failure(message string) roundTripFunc {
+	return func(_ *http.Request) (*http.Response, error) {
+		return nil, errors.New(message)
+	}
+}
+
+func TestAnalyzeRetriesTemporaryFailures(t *testing.T) {
+	temporary := map[string]roundTripFunc{
+		"network error":       failure("connection reset"),
+		"429 Too Many":        status(http.StatusTooManyRequests),
+		"500 Internal":        status(http.StatusInternalServerError),
+		"502 Bad Gateway":     status(http.StatusBadGateway),
+		"503 Unavailable":     status(http.StatusServiceUnavailable),
+		"408 Request Timeout": status(http.StatusRequestTimeout),
+	}
+
+	for name, answer := range temporary {
+		t.Run(name, func(t *testing.T) {
+			var calls int32
+
+			report := analyze(t, crawler.Options{
+				URL:        "https://example.com",
+				Retries:    2,
+				HTTPClient: sequenceClient(&calls, answer, status(http.StatusOK)),
+			})
+
+			if got := atomic.LoadInt32(&calls); got != 2 {
+				t.Errorf("requests = %d, want 2: one failure and one success", got)
+			}
+
+			page := report.Pages[0]
+			if page.Status != crawler.StatusOK || page.HTTPStatus != http.StatusOK {
+				t.Errorf("page = %+v, want ok status after a successful retry", page)
+			}
+		})
+	}
+}
+
+func TestAnalyzeDoesNotRetryPermanentFailures(t *testing.T) {
+	permanent := []int{
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed,
+	}
+
+	for _, code := range permanent {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			var calls int32
+
+			report := analyze(t, crawler.Options{
+				URL:        "https://example.com",
+				Retries:    3,
+				HTTPClient: sequenceClient(&calls, status(code)),
+			})
+
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Errorf("requests = %d, want a single attempt for code %d", got, code)
+			}
+
+			if report.Pages[0].HTTPStatus != code {
+				t.Errorf("page = %+v, want status %d", report.Pages[0], code)
+			}
+		})
+	}
+}
+
+func TestAnalyzeFailsAfterRetryLimit(t *testing.T) {
+	var calls int32
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: sequenceClient(&calls, status(http.StatusServiceUnavailable)),
+	})
+
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("requests = %d, want retries + 1 = 3", got)
+	}
+
+	page := report.Pages[0]
+	if page.Status != crawler.StatusError || page.HTTPStatus != http.StatusServiceUnavailable {
+		t.Errorf("page = %+v, want the result of the last attempt: error with code 503", page)
+	}
+}
+
+func TestAnalyzeReportsLastAttemptForLinks(t *testing.T) {
+	page := `<html><body>
+		<a href="/flaky.html">flaky</a>
+		<a href="/down.html">down</a>
+	</body></html>`
+
+	var flakyCalls, downCalls int32
+
+	client := stubClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com":
+			return htmlResponse(page, req), nil
+		case "https://example.com/flaky.html":
+			if atomic.AddInt32(&flakyCalls, 1) == 1 {
+				return response(http.StatusInternalServerError, "", req), nil
+			}
+
+			return response(http.StatusOK, "", req), nil
+		default:
+			atomic.AddInt32(&downCalls, 1)
+
+			return response(http.StatusServiceUnavailable, "", req), nil
+		}
+	})
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		Retries:    1,
+		HTTPClient: client,
+	})
+
+	broken := report.Pages[0].BrokenLinks
+	if len(broken) != 1 || broken[0].URL != "https://example.com/down.html" {
+		t.Fatalf("broken links = %+v, want only the link that stayed down", broken)
+	}
+
+	if broken[0].StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("broken[0] = %+v, want the code of the last attempt", broken[0])
+	}
+
+	if got := atomic.LoadInt32(&downCalls); got != 2 {
+		t.Errorf("requests to the broken link = %d, want retries + 1 = 2", got)
+	}
+}
+
+func TestAnalyzeWaitsBetweenRetries(t *testing.T) {
+	var calls int32
+
+	start := time.Now()
+
+	analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: sequenceClient(&calls, failure("connection reset")),
+	})
+
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Errorf("elapsed = %v, want a pause between retries instead of a burst", elapsed)
+	}
+}
+
+func TestAnalyzeStopsRetryingWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls int32
+
+	client := stubClient(func(_ *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&calls, 1)
+		cancel()
+
+		return nil, errors.New("connection reset")
+	})
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		if _, err := crawler.Analyze(ctx, crawler.Options{
+			URL:        "https://example.com",
+			Retries:    5,
+			HTTPClient: client,
+		}); err != nil {
+			t.Errorf("Analyze() error = %v", err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Analyze() keeps retrying after the context was canceled")
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("requests = %d, want no retries after the cancellation", got)
+	}
+}
